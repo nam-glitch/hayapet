@@ -778,6 +778,57 @@ async def shopify_get_inventory_levels(params: GetInventoryLevelsInput) -> str:
         return _error(e)
 
 
+class GetInventoryItemsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    inventory_item_ids: str = Field(..., description="Comma-separated inventory item IDs (max 100)")
+
+    @field_validator("inventory_item_ids")
+    @classmethod
+    def validate_ids(cls, v: str) -> str:
+        parts = [p.strip() for p in v.split(",") if p.strip()]
+        if not parts:
+            raise ValueError("At least one inventory item ID is required")
+        if len(parts) > 100:
+            raise ValueError("Maximum 100 inventory item IDs per request")
+        for p in parts:
+            if not p.isdigit():
+                raise ValueError(f"Invalid ID: {p}")
+        return ",".join(parts)
+
+
+@mcp.tool(
+    name="shopify_get_inventory_items",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_get_inventory_items(params: GetInventoryItemsInput) -> str:
+    """
+    Get inventory item details including cost per item.
+    Accepts up to 100 comma-separated inventory_item_ids.
+    Returns each item's id, sku, cost, tracked status, and country of origin.
+    Use variant.inventory_item_id from product data to look up costs.
+    """
+    try:
+        data  = await _request("GET", "inventory_items.json", params={"ids": params.inventory_item_ids})
+        items = data.get("inventory_items", [])
+
+        result = []
+        for item in items:
+            result.append({
+                "id":                    item.get("id"),
+                "sku":                   item.get("sku"),
+                "cost":                  item.get("cost"),
+                "tracked":               item.get("tracked"),
+                "country_code_of_origin": item.get("country_code_of_origin"),
+                "harmonized_system_code": item.get("harmonized_system_code"),
+                "created_at":            item.get("created_at"),
+                "updated_at":            item.get("updated_at"),
+            })
+
+        return _fmt({"count": len(result), "inventory_items": result})
+    except Exception as e:
+        return _error(e)
+
+
 class SetInventoryLevelInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     inventory_item_id: int = Field(..., description="Inventory item ID")
