@@ -778,57 +778,6 @@ async def shopify_get_inventory_levels(params: GetInventoryLevelsInput) -> str:
         return _error(e)
 
 
-class GetInventoryItemsInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    inventory_item_ids: str = Field(..., description="Comma-separated inventory item IDs (max 100)")
-
-    @field_validator("inventory_item_ids")
-    @classmethod
-    def validate_ids(cls, v: str) -> str:
-        parts = [p.strip() for p in v.split(",") if p.strip()]
-        if not parts:
-            raise ValueError("At least one inventory item ID is required")
-        if len(parts) > 100:
-            raise ValueError("Maximum 100 inventory item IDs per request")
-        for p in parts:
-            if not p.isdigit():
-                raise ValueError(f"Invalid ID: {p}")
-        return ",".join(parts)
-
-
-@mcp.tool(
-    name="shopify_get_inventory_items",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
-)
-async def shopify_get_inventory_items(params: GetInventoryItemsInput) -> str:
-    """
-    Get inventory item details including cost per item.
-    Accepts up to 100 comma-separated inventory_item_ids.
-    Returns each item's id, sku, cost, tracked status, and country of origin.
-    Use variant.inventory_item_id from product data to look up costs.
-    """
-    try:
-        data  = await _request("GET", "inventory_items.json", params={"ids": params.inventory_item_ids})
-        items = data.get("inventory_items", [])
-
-        result = []
-        for item in items:
-            result.append({
-                "id":                    item.get("id"),
-                "sku":                   item.get("sku"),
-                "cost":                  item.get("cost"),
-                "tracked":               item.get("tracked"),
-                "country_code_of_origin": item.get("country_code_of_origin"),
-                "harmonized_system_code": item.get("harmonized_system_code"),
-                "created_at":            item.get("created_at"),
-                "updated_at":            item.get("updated_at"),
-            })
-
-        return _fmt({"count": len(result), "inventory_items": result})
-    except Exception as e:
-        return _error(e)
-
-
 class SetInventoryLevelInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     inventory_item_id: int = Field(..., description="Inventory item ID")
@@ -974,6 +923,206 @@ async def shopify_get_shop(params: EmptyInput) -> str:
     try:
         data = await _request("GET", "shop.json")
         return _fmt(data.get("shop", data))
+    except Exception as e:
+        return _error(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# METAFIELDS
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ListMetafieldsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id: int            = Field(..., description="Product ID to list metafields for")
+    namespace:  Optional[str]  = Field(default=None, description="Filter by namespace, e.g. 'custom'")
+    limit:      Optional[int]  = Field(default=50, ge=1, le=250)
+
+
+@mcp.tool(
+    name="shopify_list_metafields",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_metafields(params: ListMetafieldsInput) -> str:
+    """List all metafields for a product. Optionally filter by namespace (e.g. 'custom')."""
+    try:
+        p: Dict[str, Any] = {"limit": params.limit}
+        if params.namespace:
+            p["namespace"] = params.namespace
+        data       = await _request("GET", f"products/{params.product_id}/metafields.json", params=p)
+        metafields = data.get("metafields", [])
+        # Return clean summary
+        result = []
+        for mf in metafields:
+            result.append({
+                "id":         mf.get("id"),
+                "namespace":  mf.get("namespace"),
+                "key":        mf.get("key"),
+                "value":      mf.get("value"),
+                "type":       mf.get("type"),
+                "created_at": mf.get("created_at"),
+                "updated_at": mf.get("updated_at"),
+            })
+        return _fmt({"product_id": params.product_id, "count": len(result), "metafields": result})
+    except Exception as e:
+        return _error(e)
+
+
+class SetMetafieldInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id: int           = Field(..., description="Product ID to set metafield on")
+    namespace:  str           = Field(..., description="Metafield namespace, e.g. 'custom'")
+    key:        str           = Field(..., description="Metafield key, e.g. 'urgency_line'")
+    value:      str           = Field(..., description="Metafield value")
+    type:       Optional[str] = Field(default="single_line_text_field", description="Metafield type: single_line_text_field, multi_line_text_field, number_integer, number_decimal, json, boolean, url, file_reference, etc.")
+
+
+@mcp.tool(
+    name="shopify_set_metafield",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_set_metafield(params: SetMetafieldInput) -> str:
+    """
+    Create or update a metafield on a product (upsert).
+    If a metafield with the same namespace+key already exists, it will be updated.
+    Otherwise a new metafield is created.
+    """
+    try:
+        # Step 1: Check if metafield already exists
+        existing = await _request(
+            "GET",
+            f"products/{params.product_id}/metafields.json",
+            params={"namespace": params.namespace, "key": params.key},
+        )
+        metafields = existing.get("metafields", [])
+
+        # Find matching metafield by namespace+key
+        match = None
+        for mf in metafields:
+            if mf.get("namespace") == params.namespace and mf.get("key") == params.key:
+                match = mf
+                break
+
+        if match:
+            # Step 2a: UPDATE existing metafield
+            mf_id = match["id"]
+            body = {"metafield": {"value": params.value, "type": params.type}}
+            data = await _request("PUT", f"metafields/{mf_id}.json", body=body)
+            result = data.get("metafield", data)
+            return _fmt({"action": "updated", "metafield": {
+                "id": result.get("id"),
+                "namespace": result.get("namespace"),
+                "key": result.get("key"),
+                "value": result.get("value"),
+                "type": result.get("type"),
+            }})
+        else:
+            # Step 2b: CREATE new metafield
+            body = {"metafield": {
+                "namespace": params.namespace,
+                "key":       params.key,
+                "value":     params.value,
+                "type":      params.type,
+            }}
+            data = await _request("POST", f"products/{params.product_id}/metafields.json", body=body)
+            result = data.get("metafield", data)
+            return _fmt({"action": "created", "metafield": {
+                "id": result.get("id"),
+                "namespace": result.get("namespace"),
+                "key": result.get("key"),
+                "value": result.get("value"),
+                "type": result.get("type"),
+            }})
+    except Exception as e:
+        return _error(e)
+
+
+class BulkSetMetafieldsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id: int                  = Field(..., description="Product ID to set metafields on")
+    metafields: List[Dict[str, str]] = Field(
+        ...,
+        description=(
+            "List of metafield objects, each with: namespace, key, value, "
+            "and optionally type (defaults to single_line_text_field). "
+            'Example: [{"namespace":"custom","key":"urgency_line","value":"Bestseller!"}]'
+        ),
+    )
+
+
+@mcp.tool(
+    name="shopify_set_metafields_bulk",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_set_metafields_bulk(params: BulkSetMetafieldsInput) -> str:
+    """
+    Set multiple metafields on a single product in one call (upsert each).
+    Useful for CRO setup: urgency_line, delivery_time, badges, feature cards, etc.
+    Each metafield needs: namespace, key, value. Type defaults to single_line_text_field.
+    """
+    try:
+        # Step 1: Get all existing metafields for this product
+        existing = await _request(
+            "GET",
+            f"products/{params.product_id}/metafields.json",
+            params={"limit": 250},
+        )
+        existing_mfs = existing.get("metafields", [])
+        existing_map: Dict[str, dict] = {}
+        for mf in existing_mfs:
+            existing_map[f"{mf['namespace']}.{mf['key']}"] = mf
+
+        results = []
+        for mf_input in params.metafields:
+            ns    = mf_input.get("namespace", "custom")
+            key   = mf_input.get("key", "")
+            value = mf_input.get("value", "")
+            mtype = mf_input.get("type", "single_line_text_field")
+            lookup = f"{ns}.{key}"
+
+            if not key or not value:
+                results.append({"key": key, "action": "skipped", "reason": "missing key or value"})
+                continue
+
+            try:
+                if lookup in existing_map:
+                    # Update
+                    mf_id = existing_map[lookup]["id"]
+                    body = {"metafield": {"value": value, "type": mtype}}
+                    data = await _request("PUT", f"metafields/{mf_id}.json", body=body)
+                    r = data.get("metafield", data)
+                    results.append({"key": f"{ns}.{key}", "action": "updated", "id": r.get("id"), "value": value})
+                else:
+                    # Create
+                    body = {"metafield": {"namespace": ns, "key": key, "value": value, "type": mtype}}
+                    data = await _request("POST", f"products/{params.product_id}/metafields.json", body=body)
+                    r = data.get("metafield", data)
+                    results.append({"key": f"{ns}.{key}", "action": "created", "id": r.get("id"), "value": value})
+            except Exception as inner_e:
+                results.append({"key": f"{ns}.{key}", "action": "error", "error": str(inner_e)[:200]})
+
+        return _fmt({
+            "product_id": params.product_id,
+            "total":      len(results),
+            "results":    results,
+        })
+    except Exception as e:
+        return _error(e)
+
+
+class DeleteMetafieldInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    metafield_id: int = Field(..., description="Metafield ID to delete (get from shopify_list_metafields)")
+
+
+@mcp.tool(
+    name="shopify_delete_metafield",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_delete_metafield(params: DeleteMetafieldInput) -> str:
+    """Delete a metafield by its ID. Use shopify_list_metafields first to get the ID."""
+    try:
+        await _request("DELETE", f"metafields/{params.metafield_id}.json")
+        return f"Metafield {params.metafield_id} deleted."
     except Exception as e:
         return _error(e)
 
